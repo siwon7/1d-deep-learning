@@ -135,52 +135,84 @@ class VectorQuantizer(nn.Module):
         return quantized, loss, perplexity
 
 class VQVAE(nn.Module):
-    def __init__(self, input_dim, embedding_dim, num_embeddings, commitment_cost):
+    def __init__(self, input_dim, num_latents, embedding_dim, num_embeddings, commitment_cost):
         super(VQVAE, self).__init__()
+        self.num_latents = num_latents
+        self.embedding_dim = embedding_dim
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, embedding_dim)
+            nn.Linear(256, num_latents * embedding_dim)
         )
         self.quantizer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
         self.decoder = nn.Sequential(
-            nn.Linear(embedding_dim, 128),
+            nn.Linear(num_latents * embedding_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, input_dim)
+            nn.Linear(256, input_dim)
         )
 
     def forward(self, x):
         z_e = self.encoder(x)
-        z_q, loss, perplexity = self.quantizer(z_e)
+        z_e = z_e.view(-1, self.num_latents, self.embedding_dim)
+        quantized_list = []
+        vq_loss = 0
+        perplexity = 0
+        for i in range(self.num_latents):
+            quantized, loss, p = self.quantizer(z_e[:, i, :])
+            quantized_list.append(quantized)
+            vq_loss += loss
+            perplexity += p
+        z_q = torch.stack(quantized_list, dim=1).view(-1, self.num_latents * self.embedding_dim)
         x_recon = self.decoder(z_q)
-        return x_recon, loss, perplexity
+        return x_recon, vq_loss / self.num_latents, perplexity / self.num_latents
+
+# 모델 설정
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = 1568
+num_latents = 49
+embedding_dim = 32
+num_embeddings = 512
+commitment_cost = 0.25
+vqvae = VQVAE(input_dim, num_latents, embedding_dim, num_embeddings, commitment_cost).to(device)
 
 # VQ-VAE 모델 학습
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_dim = combined_images_train_flat.shape[1]  # 1차원 데이터의 길이
-embedding_dim = 32
-num_embeddings = 256
-commitment_cost = 0.25
-vqvae = VQVAE(input_dim, embedding_dim, num_embeddings, commitment_cost).to(device)
+vqvae_model_path = 'model/VQVAE.pth'
+os.makedirs('model', exist_ok=True)
 
-optimizer = optim.Adam(vqvae.parameters(), lr=1e-3)
-num_epochs = 50
+vqvae_loaded = False
+if os.path.exists(vqvae_model_path):
+    choice = input("학습된 VQ-VAE 모델이 있습니다. 로드하시겠습니까? (Y/N): ").strip().upper()
+else:
+    choice = "N"
 
-for epoch in range(num_epochs):
-    vqvae.train()
-    train_loss = 0
-    for images, _ in train_loader:
-        images = images.to(device)
+if choice == "Y":
+    vqvae.load_state_dict(torch.load(vqvae_model_path))
+    vqvae_loaded = True
+    print("VQ-VAE 모델이 로드되었습니다.")
+else:
+    optimizer = optim.Adam(vqvae.parameters(), lr=1e-3)
+    num_epochs = 10
 
-        optimizer.zero_grad()
-        recon_images, vq_loss, _ = vqvae(images)
-        recon_loss = F.mse_loss(recon_images, images)
-        loss = recon_loss + vq_loss
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item()
+    vqvae_losses = []
+    for epoch in range(num_epochs):
+        vqvae.train()
+        train_loss = 0
+        for images, _ in train_loader:
+            images = images.to(device)
 
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {train_loss/len(train_loader):.4f}')
+            optimizer.zero_grad()
+            recon_images, vq_loss, _ = vqvae(images)
+            recon_loss = F.mse_loss(recon_images, images)
+            loss = recon_loss + vq_loss
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        vqvae_losses.append(train_loss / len(train_loader))
+        print(f'Epoch [{epoch+1}/{num_epochs}], VQ-VAE Loss: {train_loss/len(train_loader):.4f}')
+
+    # VQ-VAE 모델 저장
+    torch.save(vqvae.state_dict(), vqvae_model_path)
 
 # 학습된 VQ-VAE를 이용한 분류기 정의
 class RNNClassifier(nn.Module):
@@ -190,7 +222,7 @@ class RNNClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
-        x = x.unsqueeze(1)  # (batch_size, input_dim) -> (batch_size, seq_len, input_dim)
+        x = x.view(x.size(0), x.size(1), -1)  # (batch_size, seq_len, input_dim)
         h0 = torch.zeros(num_layers, x.size(0), hidden_dim).to(x.device)
         c0 = torch.zeros(num_layers, x.size(0), hidden_dim).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
@@ -203,81 +235,194 @@ num_layers = 2
 num_classes = 100
 
 classifier = RNNClassifier(input_dim, hidden_dim, num_layers, num_classes).to(device)
-optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
-classification_criterion = nn.CrossEntropyLoss()
+rnn_model_path = 'model/VQ_RNN.pth'
 
-# VQ-VAE를 통해 얻은 임베딩을 사용하여 학습
-num_epochs = 50
-train_losses = []
-test_accuracies = []
+rnn_loaded = False
+if os.path.exists(rnn_model_path):
+    choice = input("학습된 VQ_RNN 모델이 있습니다. 로드하시겠습니까? (Y/N): ").strip().upper()
+else:
+    choice = "N"
 
-for epoch in range(num_epochs):
-    classifier.train()
-    epoch_loss = 0
-    for images, labels in train_loader:
-        images = images.to(device)
-        labels = labels.to(device)
+if choice == "Y":
+    classifier.load_state_dict(torch.load(rnn_model_path))
+    rnn_loaded = True
+    print("VQ_RNN 모델이 로드되었습니다.")
+else:
+    optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
+    classification_criterion = nn.CrossEntropyLoss()
 
-        with torch.no_grad():
-            z_e = vqvae.encoder(images)
-            z_q, _, _ = vqvae.quantizer(z_e)
-            z_q_flat = z_q.view(z_q.size(0), -1)
+    # VQ-VAE를 통해 얻은 임베딩을 사용하여 학습
+    num_epochs = 10
+    rnn_losses = []
+    test_accuracies = []
 
-        optimizer.zero_grad()
-        outputs = classifier(z_q_flat)
-        loss = classification_criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss += loss.item()
-
-    train_losses.append(epoch_loss / len(train_loader))
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(train_loader):.4f}')
-
-    # Evaluate on the test set
-    classifier.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
+    for epoch in range(num_epochs):
+        classifier.train()
+        epoch_loss = 0
+        for images, labels in train_loader:
             images = images.to(device)
             labels = labels.to(device)
-            z_e = vqvae.encoder(images)
-            z_q, _, _ = vqvae.quantizer(z_e)
-            z_q_flat = z_q.view(z_q.size(0), -1)
-            outputs = classifier(z_q_flat)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
 
-    accuracy = 100 * correct / total
-    test_accuracies.append(accuracy)
-    print(f'Test Accuracy: {accuracy:.2f}%')
+            with torch.no_grad():
+                z_e = vqvae.encoder(images)
+                z_e = z_e.view(-1, num_latents, embedding_dim)
+                quantized_list = []
+                for i in range(num_latents):
+                    quantized, _, _ = vqvae.quantizer(z_e[:, i, :])
+                    quantized_list.append(quantized)
+                z_q = torch.stack(quantized_list, dim=1)
 
-# 학습 종료 후 그래프 그리기
-plt.figure()
-epochs = range(1, num_epochs + 1)
-plt.plot(epochs, train_losses, label='Loss', color='blue')
-plt.xlabel('Epochs')
+            optimizer.zero_grad()
+            outputs = classifier(z_q)
+            loss = classification_criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-plt.ylabel('Loss', color='blue')
-plt.tick_params(axis='y', labelcolor='blue')
+            epoch_loss += loss.item()
 
-ax2 = plt.gca().twinx()
-ax2.plot(epochs, test_accuracies, label='Accuracy', color='red')
-ax2.set_ylabel('Accuracy (%)', color='red')
-ax2.tick_params(axis='y', labelcolor='red')
+        rnn_losses.append(epoch_loss / len(train_loader))
+        print(f'Epoch [{epoch+1}/{num_epochs}], RNN Loss: {epoch_loss/len(train_loader):.4f}')
 
-plt.title('Training Loss and Test Accuracy')
-plt.legend(loc='upper right')
-plt.savefig(f'VQ_RNN_graphs/loss_accuracy.png')
-plt.close()
+        # Evaluate on the test set
+        classifier.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                z_e = vqvae.encoder(images)
+                z_e = z_e.view(-1, num_latents, embedding_dim)
+                quantized_list = []
+                for i in range(num_latents):
+                    quantized, _, _ = vqvae.quantizer(z_e[:, i, :])
+                    quantized_list.append(quantized)
+                z_q = torch.stack(quantized_list, dim=1)
+                outputs = classifier(z_q)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
 
-# 손실 및 정확도 표로 저장
-results_df = pd.DataFrame({
-    'Epoch': range(1, num_epochs + 1),
-    'Loss': train_losses,
-    'Accuracy': test_accuracies
+        accuracy = 100 * correct / total
+        test_accuracies.append(accuracy)
+        print(f'Test Accuracy: {accuracy:.2f}%')
+
+    # RNN 모델 저장
+    torch.save(classifier.state_dict(), rnn_model_path)
+
+# 테스트 시간 측정 및 예측 결과 저장
+classifier.eval()
+start_time = time.time()
+
+correct = 0
+total = 0
+all_labels = []
+all_predictions = []
+
+# VQ_RNN 폴더 생성 및 하위 폴더 생성
+os.makedirs('VQ_RNN', exist_ok=True)
+for i in range(100):
+    os.makedirs(f'VQ_RNN/{i:02d}', exist_ok=True)
+
+with torch.no_grad():
+    for i, (images, labels) in enumerate(test_loader):
+        images = images.to(device)
+        labels = labels.to(device)
+        z_e = vqvae.encoder(images)
+        z_e = z_e.view(-1, num_latents, embedding_dim)
+        quantized_list = []
+        for i in range(num_latents):
+            quantized, _, _ = vqvae.quantizer(z_e[:, i, :])
+            quantized_list.append(quantized)
+        z_q = torch.stack(quantized_list, dim=1)
+        outputs = classifier(z_q)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+        all_labels.extend(labels.cpu().numpy())
+        all_predictions.extend(predicted.cpu().numpy())
+
+        # 예측된 결과에 따라 이미지를 해당 폴더에 저장
+        for j in range(images.size(0)):
+            img = images[j].cpu().numpy().reshape(28, 56)
+            label = predicted[j].item()
+            plt.imsave(f'VQ_RNN/{label:02d}/{i*32+j}.png', img, cmap='gray')
+
+end_time = time.time()
+test_time = end_time - start_time
+
+print(f'Test Accuracy: {100 * correct / total:.2f}%')
+print(f'Test Time: {test_time:.2f} seconds')
+
+# 그래프와 결과 저장을 위한 디렉토리 생성
+os.makedirs('VQ_RNN_graphs', exist_ok=True)
+
+# 테스트 시간 저장
+test_time_df = pd.DataFrame({
+    'Total Test Time (seconds)': [test_time]
 })
 
-results_df.to_csv('VQ_RNN_graphs/loss_accuracy.csv', index=False)
+test_time_df.to_csv('VQ_RNN_graphs/test_time.csv', index=False)
+
+# 예측 결과 저장
+predictions_df = pd.DataFrame({
+    'Label': all_labels,
+    'Prediction': all_predictions
+})
+
+predictions_df.to_csv('VQ_RNN_graphs/predictions.csv', index=False)
+
+if not vqvae_loaded:
+    # VQ-VAE 손실 그래프 그리기
+    plt.figure()
+    epochs = range(1, num_epochs + 1)
+    plt.plot(epochs, vqvae_losses, label='VQ-VAE Loss', color='blue')
+    plt.xlabel('Epochs')
+    plt.ylabel('VQ-VAE Loss', color='blue')
+    plt.tick_params(axis='y', labelcolor='blue')
+    plt.title('VQ-VAE Training Loss')
+    plt.legend(loc='upper right')
+    plt.savefig(f'VQ_RNN_graphs/vqvae_loss.png')
+    plt.close()
+
+if not rnn_loaded:
+    # RNN 손실 및 정확도 그래프 그리기
+    plt.figure()
+    plt.plot(epochs, rnn_losses, label='RNN Loss', color='blue')
+    plt.xlabel('Epochs')
+    plt.ylabel('RNN Loss', color='blue')
+    plt.tick_params(axis='y', labelcolor='blue')
+    plt.title('RNN Training Loss')
+    plt.legend(loc='upper right')
+    plt.savefig(f'VQ_RNN_graphs/rnn_loss.png')
+    plt.close()
+
+    plt.figure()
+    plt.plot(epochs, test_accuracies, label='Accuracy', color='red')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy (%)', color='red')
+    plt.tick_params(axis='y', labelcolor='red')
+    plt.title('RNN Test Accuracy')
+    plt.legend(loc='upper right')
+    plt.savefig(f'VQ_RNN_graphs/rnn_accuracy.png')
+    plt.close()
+
+    # 손실 및 정확도 표로 저장
+    results_df = pd.DataFrame({
+        'Epoch': range(1, num_epochs + 1),
+        'VQ-VAE Loss': vqvae_losses,
+        'RNN Loss': rnn_losses,
+        'Accuracy': test_accuracies
+    })
+
+    results_df.to_csv('VQ_RNN_graphs/loss_accuracy.csv', index=False)
+
+# 데이터와 라벨 저장
+os.makedirs('combined_data', exist_ok=True)
+np.save('combined_data/X_train.npy', combined_images_train_flat)
+np.save('combined_data/y_train.npy', combined_labels_train)
+np.save('combined_data/X_test.npy', combined_images_test_flat)
+np.save('combined_data/y_test.npy', combined_labels_test)
+
+print("데이터와 라벨 저장 완료")
