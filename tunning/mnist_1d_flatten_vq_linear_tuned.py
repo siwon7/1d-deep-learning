@@ -301,7 +301,7 @@ for num_embeddings in num_embeddings_list:
 
             linear_losses.append(epoch_loss / len(train_loader))
             print(
-                f'Experiment {experiment_dir} - Epoch [{epoch+1}/{num_epochs}], Logistic Regression Loss: {epoch_loss/len(train_loader):.4f}')
+                f'Experiment {experiment_dir} - Epoch [{epoch+1}/{num_epochs}], Linear Regression Loss: {epoch_loss/len(train_loader):.4f}')
 
         # 테스트 시간 측정 및 예측 결과 저장
         classifier.eval()
